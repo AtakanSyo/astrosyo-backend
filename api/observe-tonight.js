@@ -16,6 +16,59 @@ async function getWeather(lat, lon) {
   return await res.json();
 }
 
+
+function computeBestWindow(weather, hours = 12, windowHours = 2) {
+  const times = weather.hourly.time.slice(0, hours);
+  const clouds = weather.hourly.cloud_cover.slice(0, hours);
+  const precip = weather.hourly.precipitation.slice(0, hours);
+  const wind = weather.hourly.wind_speed_10m.slice(0, hours);
+
+  if (times.length < windowHours) return null;
+
+  // score: lower is better
+  // clouds dominates, precipitation is heavily penalized, wind lightly
+  const scoreAt = (i) => {
+    const c = avg(clouds.slice(i, i + windowHours));
+    const p = sum(precip.slice(i, i + windowHours));
+    const w = avg(wind.slice(i, i + windowHours));
+    return c * 1.0 + p * 100.0 + w * 0.2;
+  };
+
+  let bestI = 0;
+  let bestScore = scoreAt(0);
+
+  for (let i = 1; i <= times.length - windowHours; i++) {
+    const s = scoreAt(i);
+    if (s < bestScore) {
+      bestScore = s;
+      bestI = i;
+    }
+  }
+
+  const start = times[bestI];
+  const end = times[bestI + windowHours - 1];
+
+  return {
+    start,
+    end,
+    window_hours: windowHours,
+    avg_cloud_cover_percent: Math.round(avg(clouds.slice(bestI, bestI + windowHours))),
+    total_precip_mm: round1(sum(precip.slice(bestI, bestI + windowHours))),
+    avg_wind_kmh: round1(avg(wind.slice(bestI, bestI + windowHours))),
+    score: round1(bestScore),
+  };
+}
+
+function avg(arr) {
+  return arr.reduce((a, b) => a + b, 0) / (arr.length || 1);
+}
+function sum(arr) {
+  return arr.reduce((a, b) => a + b, 0);
+}
+function round1(x) {
+  return Math.round(x * 10) / 10;
+}
+
 function summarizeTonight(weather) {
   const clouds = weather.hourly.cloud_cover.slice(0, 6);
   const precip = weather.hourly.precipitation.slice(0, 6);
@@ -122,6 +175,7 @@ module.exports = async (req, res) => {
     }
 
     const weather = await getWeather(lat, lon);
+    const best_window = computeBestWindow(weather, 12, 2);
     const tonight = summarizeTonight(weather);
     const plan = makeRuleBasedPlan(tonight, equipment);
 
@@ -136,6 +190,7 @@ module.exports = async (req, res) => {
       ok: true,
       received: { lat, lon, equipment },
       tonight,
+      best_window,
       plan,
       ai_plan,
       weather: {
