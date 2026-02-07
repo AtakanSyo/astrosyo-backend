@@ -72,17 +72,19 @@ async function getAiPlan({ tonight, equipment }) {
     {
       role: "system",
       content:
-        "You are an astronomy observing assistant. Be honest and practical. Keep the answer short (max 5 bullet points).",
+        "You are an astronomy observing assistant. Be honest and practical. " +
+        "Return EXACTLY 5 short lines. Each line MUST start with '- '. " +
+        "No markdown, no bold, no numbering, no extra text."
     },
     {
-      role: "user",
-      content:
-        `Conditions verdict: ${tonight.verdict}.
-Average cloud cover: ${tonight.avg_cloud_cover_percent}%.
-Total precipitation: ${tonight.total_precip_mm} mm.
-Telescope aperture: ${equipment?.aperture_mm || "unknown"} mm.
+  role: "user",
+  content:
+    `Conditions verdict: ${tonight.verdict}
+Average cloud cover: ${tonight.avg_cloud_cover_percent}%
+Total precipitation: ${tonight.total_precip_mm} mm
+Telescope aperture: ${equipment?.aperture_mm || "unknown"} mm
 
-User asks: What can I observe tonight?`,
+Task: Suggest what to observe tonight for this setup and conditions.`
     },
   ];
 
