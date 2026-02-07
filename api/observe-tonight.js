@@ -74,7 +74,8 @@ async function getAiPlan({ tonight, equipment }) {
       content:
         "You are an astronomy observing assistant. Be honest and practical. " +
         "Return EXACTLY 5 short lines. Each line MUST start with '- '. " +
-        "No markdown, no bold, no numbering. No extra whitespace. Plain text only."
+        "No markdown, no bold, no numbering. No extra whitespace. Plain text only. " +
+        "IMPORTANT: If cloud cover >= 90% OR precipitation > 0, say observing is unlikely and suggest indoor/planning alternatives."
     },
     {
   role: "user",
