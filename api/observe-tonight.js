@@ -16,6 +16,89 @@ async function getWeather(lat, lon) {
   return await res.json();
 }
 
+const fs = require("fs");
+const path = require("path");
+
+let MESSIER_CACHE = null;
+
+function loadMessier() {
+  if (MESSIER_CACHE) return MESSIER_CACHE;
+  const p = path.join(process.cwd(), "data", "messier.json");
+  const raw = fs.readFileSync(p, "utf8");
+  MESSIER_CACHE = JSON.parse(raw);
+  return MESSIER_CACHE;
+}
+
+const Astronomy = require("astronomy-engine");
+const { DateTime } = require("luxon");
+
+function toDateInWeatherTZ(isoLocal, tz) {
+  // isoLocal looks like: "2026-02-08T22:00"
+  // Interpret it as time in that timezone
+  return DateTime.fromISO(isoLocal, { zone: tz || "UTC" }).toJSDate();
+}
+
+function altitudeDeg(lat, lon, date, raDeg, decDeg) {
+  const observer = new Astronomy.Observer(lat, lon, 0);
+
+  // Horizon(date, observer, ra, dec, refraction)
+  const hor = Astronomy.Horizon(
+    date,
+    observer,
+    raDeg,
+    decDeg,
+    "normal"   // or "none" if you want geometric altitude
+  );
+
+  return hor.altitude; // degrees
+}
+
+function pickTargets({ lat, lon, date, apertureMm, max = 8 }) {
+  const messier = loadMessier();
+
+  const scored = [];
+  for (const o of messier) {
+    const ra = Number(o.ra_deg);
+    const dec = Number(o.dec_deg);
+    if (!Number.isFinite(ra) || !Number.isFinite(dec)) continue;
+
+    const alt = altitudeDeg(lat, lon, date, ra, dec);
+
+    // hard filter: below horizon / too low (you can tune)
+    if (alt < 15) continue;
+
+    const mag = Number(o.apparent_magnitude);
+    const major = Number(o.size_major_arcmin);
+
+    // ----- simple scoring (tune later) -----
+    // altitude dominates
+    let score = alt * 2.0;
+
+    // reward brighter objects (lower mag)
+    if (Number.isFinite(mag)) score += (10 - mag) * 3.0;
+
+    // aperture helps faint stuff a bit
+    if (Number.isFinite(apertureMm)) score += Math.min(2.0, (apertureMm - 80) / 80);
+
+    // small bonus for larger apparent size (nice visually)
+    if (Number.isFinite(major)) score += Math.min(2.0, major / 30);
+
+    // tiny type-based bonus (optional)
+    const t = (o.object_type || "").toLowerCase();
+    if (t.includes("globular")) score += 0.6;
+    if (t.includes("open cluster")) score += 0.4;
+    if (t.includes("nebula")) score += 0.7;
+
+    scored.push({
+      ...o,
+      altitude_deg: Math.round(alt * 10) / 10,
+      score: Math.round(score * 10) / 10,
+    });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, max);
+}
 
 function computeBestWindow(weather, hours = 12, windowHours = 2) {
   const times = weather.hourly.time.slice(0, hours);
@@ -100,9 +183,9 @@ function summarizeTonight(weather) {
   const avgCloud = clouds.reduce((a, b) => a + b, 0) / clouds.length;
   const totalPrecip = precip.reduce((a, b) => a + b, 0);
 
-  let verdict = "OK";
-  if (avgCloud > 80 || totalPrecip > 1) verdict = "Bad";
-  else if (avgCloud > 50) verdict = "Mixed";
+  let verdict = "ok";
+  if (avgCloud > 80 || totalPrecip > 1) verdict = "bad";
+  else if (avgCloud > 50) verdict = "mixed";
 
   return {
     verdict,
@@ -110,11 +193,11 @@ function summarizeTonight(weather) {
     total_precip_mm: Math.round(totalPrecip * 10) / 10,
   };
 }
-
 function makeRuleBasedPlan(tonight, equipment) {
   const aperture = equipment?.aperture_mm;
+  const v = String(tonight?.verdict || "").toLowerCase();
 
-  if (tonight.verdict === "Bad") {
+  if (v === "bad") {
     return [
       "Clouds/precip look bad. Expect limited observing.",
       "If there are brief gaps: try the Moon (if up) or bright planets.",
@@ -122,7 +205,7 @@ function makeRuleBasedPlan(tonight, equipment) {
     ];
   }
 
-  if (tonight.verdict === "Mixed") {
+  if (v === "mixed") {
     return [
       "Conditions are mixed. Watch for clear windows.",
       "Focus on bright targets: planets, Moon, bright star clusters.",
@@ -144,15 +227,35 @@ function makeRuleBasedPlan(tonight, equipment) {
   return base;
 }
 
-async function getAiPlan({ tonight, equipment, location, weather }) {
+function sanitizeAiPlan(text) {
+  if (!text) return null;
+  return String(text)
+    .split("\n")
+    .map(l => l.trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .map(l => l.startsWith("- ") ? l : `- ${l.replace(/^[-•]\s*/, "")}`)
+    .join("\n");
+}
+
+async function getAiPlan({ tonight, equipment, location, weather, targets }) {
+  const topTargetsText = (targets || [])
+    .slice(0, 6)
+    .map(t =>
+      `- ${t.messier_no} (${t.ngcic_no}) ${t.common_name || ""} | ${t.object_type} | mag ${t.apparent_magnitude} | alt ${t.altitude_deg}°`
+    )
+    .join("\n");
+
   const messages = [
     {
       role: "system",
       content:
-        "You are an astronomy observing assistant. Be honest and practical. " +
-        "Return EXACTLY 5 short lines. Each line MUST start with '- '. " +
-        "No markdown, no bold, no numbering. No extra whitespace. Plain text only. " +
-        "IMPORTANT: If the conditions verdict is 'Bad', clearly say that observing is unlikely and suggest indoor or planning alternatives."
+        "You are an astronomy observing assistant. " +
+        "Return EXACTLY 5 lines. " +
+        "Each line MUST start with '- ' (dash + space). " +
+        "No blank lines. No trailing spaces. No extra punctuation at line ends. " +
+        "Plain text only." +
+        "IMPORTANT: If verdict is Bad, do NOT recommend more than 1-2 targets. Instead focus on “unlikely observing” + alternatives."
     },
     {
       role: "user",
@@ -167,6 +270,9 @@ Conditions verdict: ${tonight.verdict}
 Average cloud cover: ${tonight.avg_cloud_cover_percent}%
 Total precipitation: ${tonight.total_precip_mm} mm
 Telescope aperture: ${equipment?.aperture_mm || "unknown"} mm
+
+Candidate visible Messier targets (ranked):
+${topTargetsText || "- (none found)"}
 
 Task: Suggest what to observe tonight for this setup and conditions.`
     },
@@ -216,14 +322,27 @@ module.exports = async (req, res) => {
       local_time: localNowFromWeather(weather),
     };
     const best_window = computeBestWindow(weather, 12, 2);
+    let targets = [];
+    if (best_window?.start) {
+      const tz = weather.timezone;
+      const d = toDateInWeatherTZ(best_window.start, tz);
+      targets = pickTargets({
+        lat,
+        lon,
+        date: d,
+        apertureMm: equipment?.aperture_mm,
+        max: 8,
+      });
+    }
     const tonight = summarizeTonight(weather);
+
     const plan = makeRuleBasedPlan(tonight, equipment);
 
     let ai_plan = null;
     let ai_error = null;
 
     try {
-      ai_plan = await getAiPlan({ tonight, equipment, location, weather });
+      ai_plan = sanitizeAiPlan(await getAiPlan({ tonight, equipment, location, weather, targets }));
     } catch (e) {
       ai_error = e?.message || String(e);
       console.error("AI PLAN ERROR:", e);
@@ -235,6 +354,7 @@ module.exports = async (req, res) => {
       received: { lat, lon, equipment, location },
       tonight,
       best_window,
+      targets,
       plan,
       ai_plan,
       weather: {
