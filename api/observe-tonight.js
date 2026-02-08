@@ -69,6 +69,30 @@ function round1(x) {
   return Math.round(x * 10) / 10;
 }
 
+function hemiLat(lat) {
+  return lat >= 0 ? "N" : "S";
+}
+function hemiLon(lon) {
+  return lon >= 0 ? "E" : "W";
+}
+function formatLatLon(lat, lon, digits = 4) {
+  const alat = Math.abs(lat).toFixed(digits);
+  const alon = Math.abs(lon).toFixed(digits);
+  return `${alat}° ${hemiLat(lat)}, ${alon}° ${hemiLon(lon)}`;
+}
+
+/**
+ * Very small helper: get a "local-ish" current time string.
+ * Open-Meteo hourly.time is already in the requested timezone (timezone=auto).
+ * We'll use the first hourly time as the local baseline.
+ */
+function localNowFromWeather(weather) {
+  const t0 = weather?.hourly?.time?.[0];
+  if (!t0) return null;
+  // t0 looks like "2026-02-08T10:00" in local timezone
+  return t0;
+}
+
 function summarizeTonight(weather) {
   const clouds = weather.hourly.cloud_cover.slice(0, 6);
   const precip = weather.hourly.precipitation.slice(0, 6);
@@ -120,7 +144,7 @@ function makeRuleBasedPlan(tonight, equipment) {
   return base;
 }
 
-async function getAiPlan({ tonight, equipment }) {
+async function getAiPlan({ tonight, equipment, location, weather }) {
   const messages = [
     {
       role: "system",
@@ -128,12 +152,18 @@ async function getAiPlan({ tonight, equipment }) {
         "You are an astronomy observing assistant. Be honest and practical. " +
         "Return EXACTLY 5 short lines. Each line MUST start with '- '. " +
         "No markdown, no bold, no numbering. No extra whitespace. Plain text only. " +
-        "IMPORTANT: If cloud cover >= 90% OR precipitation > 0, say observing is unlikely and suggest indoor/planning alternatives."
+        "IMPORTANT: If the conditions verdict is 'Bad', clearly say that observing is unlikely and suggest indoor or planning alternatives."
     },
     {
-  role: "user",
-  content:
-    `Conditions verdict: ${tonight.verdict}
+      role: "user",
+      content:
+        `Location: ${location?.label || "unknown"}
+Latitude/Longitude: ${location?.latlon || "unknown"}
+Hemisphere: ${location?.hemisphere || "unknown"}
+Local timezone: ${weather?.timezone || "unknown"}
+Local time (approx): ${location?.local_time || "unknown"}
+
+Conditions verdict: ${tonight.verdict}
 Average cloud cover: ${tonight.avg_cloud_cover_percent}%
 Total precipitation: ${tonight.total_precip_mm} mm
 Telescope aperture: ${equipment?.aperture_mm || "unknown"} mm
@@ -161,6 +191,7 @@ function readJsonBody(req) {
   return null;
 }
 
+//HANDLER
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") {
@@ -175,20 +206,33 @@ module.exports = async (req, res) => {
     }
 
     const weather = await getWeather(lat, lon);
+    const location = {
+      lat,
+      lon,
+      hemisphere: `${hemiLat(lat)}/${hemiLon(lon)}`,
+      latlon: formatLatLon(lat, lon, 4),
+      // optional: you can send city/country from the app later
+      label: formatLatLon(lat, lon, 2),
+      local_time: localNowFromWeather(weather),
+    };
     const best_window = computeBestWindow(weather, 12, 2);
     const tonight = summarizeTonight(weather);
     const plan = makeRuleBasedPlan(tonight, equipment);
 
     let ai_plan = null;
+    let ai_error = null;
+
     try {
-      ai_plan = await getAiPlan({ tonight, equipment });
+      ai_plan = await getAiPlan({ tonight, equipment, location, weather });
     } catch (e) {
+      ai_error = e?.message || String(e);
+      console.error("AI PLAN ERROR:", e);
       ai_plan = null;
     }
 
     return res.status(200).json({
       ok: true,
-      received: { lat, lon, equipment },
+      received: { lat, lon, equipment, location },
       tonight,
       best_window,
       plan,
